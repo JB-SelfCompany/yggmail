@@ -9,8 +9,8 @@ echo ========================================
 echo.
 
 REM Set Android SDK path
-set ANDROID_HOME=G:\Programms\SDK
-set ANDROID_SDK_ROOT=G:\Programms\SDK
+set ANDROID_HOME=your\path\to\sdk
+set ANDROID_SDK_ROOT=your\path\to\sdk
 
 REM Check if Android SDK exists
 if not exist "%ANDROID_HOME%" (
