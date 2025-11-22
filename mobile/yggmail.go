@@ -54,27 +54,30 @@ type ConnectionCallback interface {
 
 // YggmailService is the main service class for Android/iOS
 type YggmailService struct {
-	config         *config.Config
-	storage        *sqlite3.SQLite3Storage
-	transport      *transport.YggdrasilTransport
-	queues         *smtpsender.Queues
-	imapBackend    *imapserver.Backend
-	imapServer     *imapserver.IMAPServer
-	imapNotify     *imapserver.IMAPNotify
-	localSMTP      *smtp.Server
-	overlaySMTP    *smtp.Server
-	logger         *log.Logger
-	logCallback    LogCallback
-	mailCallback   MailCallback
-	connCallback   ConnectionCallback
-	running        bool
-	stopChan       chan struct{}
-	smtpDone       chan struct{}
-	overlayDone    chan struct{}
-	mu             sync.RWMutex
-	databasePath   string
-	smtpAddr       string
-	imapAddr       string
+	config            *config.Config
+	storage           *sqlite3.SQLite3Storage
+	transport         *transport.YggdrasilTransport
+	queues            *smtpsender.Queues
+	imapBackend       *imapserver.Backend
+	imapServer        *imapserver.IMAPServer
+	imapNotify        *imapserver.IMAPNotify
+	localSMTP         *smtp.Server
+	overlaySMTP       *smtp.Server
+	logger            *log.Logger
+	logCallback       LogCallback
+	mailCallback      MailCallback
+	connCallback      ConnectionCallback
+	running           bool
+	stopChan          chan struct{}
+	smtpDone          chan struct{}
+	overlayDone       chan struct{}
+	mu                sync.RWMutex
+	databasePath      string
+	smtpAddr          string
+	imapAddr          string
+	lastPeers         string
+	lastMulticast     bool
+	lastMulticastRegex string
 }
 
 // NewYggmailService creates a new instance of Yggmail service
@@ -262,6 +265,11 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 
 	// Start overlay SMTP server (for Yggdrasil network)
 	go s.startOverlaySMTP()
+
+	// Store connection parameters for potential reconnection
+	s.lastPeers = peers
+	s.lastMulticast = enableMulticast
+	s.lastMulticastRegex = multicastRegex
 
 	s.running = true
 	s.logger.Println("Yggmail service started successfully")
@@ -782,6 +790,76 @@ func (s *YggmailService) GetSMTPAddress() string {
 // GetIMAPAddress returns the local IMAP server address
 func (s *YggmailService) GetIMAPAddress() string {
 	return s.imapAddr
+}
+
+// OnNetworkChange should be called when network connectivity changes (WiFi <-> Mobile)
+// This helps maintain stable connections on mobile devices
+func (s *YggmailService) OnNetworkChange() error {
+	s.mu.RLock()
+	running := s.running
+	peers := s.lastPeers
+	multicast := s.lastMulticast
+	multicastRegex := s.lastMulticastRegex
+	s.mu.RUnlock()
+
+	if !running {
+		s.logger.Println("Network changed but service not running")
+		return nil
+	}
+
+	s.logger.Println("Network change detected, refreshing connections...")
+
+	// Close existing transport to force reconnection
+	if s.transport != nil {
+		// Close the listener which will trigger reconnection
+		if err := s.transport.Listener().Close(); err != nil {
+			s.logger.Printf("Error closing transport on network change: %v\n", err)
+		}
+	}
+
+	// Restart transport with same parameters
+	s.mu.Lock()
+	rawLogger := log.New(s.logger.Writer(), "", 0)
+	newTransport, err := transport.NewYggdrasilTransport(
+		rawLogger,
+		s.config.PrivateKey,
+		s.config.PublicKey,
+		strings.Split(peers, ","),
+		multicast,
+		multicastRegex,
+	)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("failed to recreate transport: %w", err)
+	}
+	s.transport = newTransport
+
+	// Update queues with new transport
+	if s.queues != nil {
+		s.queues.Transport = newTransport
+	}
+	s.mu.Unlock()
+
+	s.logger.Println("Network connections refreshed successfully")
+	if s.connCallback != nil {
+		s.connCallback.OnConnected("network_refreshed")
+	}
+
+	return nil
+}
+
+// GetConnectionStats returns basic connection statistics
+func (s *YggmailService) GetConnectionStats() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.running {
+		return "Service not running"
+	}
+
+	stats := fmt.Sprintf("Running: %v, Peers: %s, Multicast: %v",
+		s.running, s.lastPeers, s.lastMulticast)
+	return stats
 }
 
 // logWriter is a custom writer that forwards logs to the callback

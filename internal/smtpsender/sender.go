@@ -51,7 +51,8 @@ func (qs *Queues) manager() {
 	for _, destination := range destinations {
 		_, _ = qs.queueFor(destination)
 	}
-	time.AfterFunc(time.Minute, qs.manager)
+	// Reduced retry interval for faster delivery attempts (mobile-friendly)
+	time.AfterFunc(time.Second*30, qs.manager)
 }
 
 func (qs *Queues) QueueFor(from string, rcpts []string, content []byte) error {
@@ -100,15 +101,36 @@ type Queue struct {
 	queues      *Queues
 	destination string
 	running     atomic.Bool
+	retryCount  int
+	lastAttempt time.Time
 }
 
 func (q *Queue) run() {
 	defer q.running.Store(false)
 	defer q.queues.Storage.MailExpunge("Outbox") // nolint:errcheck
 
+	// Implement exponential backoff for mobile network stability
+	if !q.lastAttempt.IsZero() && q.retryCount > 0 {
+		// Backoff intervals: 5s, 10s, 20s, 40s, 60s (max)
+		backoffSeconds := 5 * (1 << uint(q.retryCount-1))
+		if backoffSeconds > 60 {
+			backoffSeconds = 60
+		}
+		waitTime := time.Duration(backoffSeconds) * time.Second
+		elapsed := time.Since(q.lastAttempt)
+		if elapsed < waitTime {
+			remaining := waitTime - elapsed
+			q.queues.Log.Printf("Waiting %v before retry to %s (attempt %d)\n", remaining, q.destination, q.retryCount+1)
+			time.Sleep(remaining)
+		}
+	}
+	q.lastAttempt = time.Now()
+
 	refs, err := q.queues.Storage.QueueMailIDsForDestination(q.destination)
 	if err != nil {
 		q.queues.Log.Println("Error with queue:", err)
+		q.retryCount++
+		return
 	}
 
 	q.queues.Log.Println("There are", len(refs), "mail(s) queued for", q.destination)
@@ -172,9 +194,11 @@ func (q *Queue) run() {
 
 			return nil
 		}(); err != nil {
-			q.queues.Log.Println("Will retry sending to", q.destination, "later due to error:", err)
+			q.retryCount++
+			q.queues.Log.Printf("Failed to send to %s (retry count: %d): %v\n", q.destination, q.retryCount, err)
 			// TODO: Send a mail to the inbox on the first instance?
 		} else {
+			q.retryCount = 0 // Reset retry count on success
 			q.queues.Log.Println("Sent mail from", ref.From, "to", q.destination)
 		}
 	}
