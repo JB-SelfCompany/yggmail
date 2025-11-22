@@ -1,6 +1,8 @@
-# Yggmail
+# Yggmail (Android Fork)
 
 It's email, but not as you know it.
+
+> **Note**: This is a fork of the [original Yggmail project](https://github.com/neilalexander/yggmail) with added support for Android library compilation via gomobile.
 
 ## Introduction
 
@@ -78,6 +80,83 @@ There are a few important notes:
 * You can only email other Yggmail users, not regular email addresses on the public Internet;
 * You may need to configure your client to allow "insecure" or "plaintext" authentication to IMAP/SMTP — this is because we don't support SSL/TLS on the IMAP/SMTP listeners yet;
 * Yggmail won't transport mails larger than 1MB right now.
+
+## Android Library Build
+
+This fork includes the `mobile/` directory with Go bindings for building an Android library using [gomobile](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile).
+
+### Changes from Original
+
+* **Added `mobile/yggmail.go`**: Go bindings for Android/iOS with complete API for mail operations, callbacks, and service management
+* **Fixed IMAP server shutdown**: Added proper `Close()` method in `internal/imapserver/imap.go` to cleanly close IMAP connections, which is essential for library lifecycle management on mobile platforms
+
+### Prerequisites
+
+1. Install Go (1.24.0 or later)
+2. Install gomobile:
+   ```bash
+   go install golang.org/x/mobile/cmd/gomobile@latest
+   gomobile init
+   ```
+
+3. Set up Android SDK and NDK:
+   - Install Android Studio or Android SDK command-line tools
+   - Set `ANDROID_HOME` environment variable pointing to your Android SDK
+   - Install NDK (recommended version 25.x or later)
+
+### Building the Android Library
+
+```bash
+# Build AAR file for Android
+gomobile bind -target=android -o yggmail.aar -androidapi 21 github.com/neilalexander/yggmail/mobile
+```
+
+This will generate:
+- `yggmail.aar` - Android library archive
+- `yggmail-sources.jar` - Source code for IDE integration
+
+### Build Options
+
+You can customize the build with additional flags:
+
+```bash
+# Build for specific architectures (reduces size)
+gomobile bind -target=android/arm64,android/amd64 -o yggmail.aar github.com/neilalexander/yggmail/mobile
+
+# Build with specific Android API level
+gomobile bind -target=android -androidapi 26 -o yggmail.aar github.com/neilalexander/yggmail/mobile
+```
+
+### Using the Library in Android
+
+1. Copy `yggmail.aar` to your Android project's `app/libs/` directory
+2. Add to `app/build.gradle`:
+   ```gradle
+   dependencies {
+       implementation files('libs/yggmail.aar')
+   }
+   ```
+
+3. Use the library in your code:
+   ```java
+   import mobile.YggmailService;
+
+   // Initialize service
+   YggmailService service = Mobile.newYggmailService(
+       "/path/to/database.db",
+       "localhost:1025",  // SMTP
+       "localhost:1143"   // IMAP
+   );
+
+   // Initialize and start
+   service.initialize();
+   service.start("tls://peer1.example.com:12345", true, ".*");
+
+   // Get email address
+   String address = service.getMailAddress();
+   ```
+
+For detailed API documentation, see the source code in `mobile/yggmail.go`.
 
 ## Bugs
 

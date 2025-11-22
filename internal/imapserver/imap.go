@@ -9,8 +9,6 @@
 package imapserver
 
 import (
-	"log"
-
 	idle "github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/server"
 	"github.com/emersion/go-sasl"
@@ -40,8 +38,16 @@ func NewIMAPServer(backend *Backend, addr string, insecure bool) (*IMAPServer, *
 	})
 	go func() {
 		if err := s.server.ListenAndServe(); err != nil {
-			log.Fatal(err)
+			backend.Log.Printf("IMAP server stopped: %v", err)
 		}
 	}()
 	return s, notify, nil
+}
+
+// Close closes the IMAP server
+func (s *IMAPServer) Close() error {
+	if s.server != nil {
+		return s.server.Close()
+	}
+	return nil
 }
