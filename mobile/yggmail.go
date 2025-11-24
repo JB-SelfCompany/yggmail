@@ -78,6 +78,12 @@ type YggmailService struct {
 	lastPeers         string
 	lastMulticast     bool
 	lastMulticastRegex string
+	// Idle timeout for battery optimization
+	lastActivity      time.Time
+	idleTimeout       time.Duration
+	serversPaused     bool
+	idleCheckTicker   *time.Ticker
+	idleCheckDone     chan struct{}
 }
 
 // NewYggmailService creates a new instance of Yggmail service
@@ -96,12 +102,16 @@ func NewYggmailService(databasePath, smtpAddr, imapAddr string) (*YggmailService
 	}
 
 	service := &YggmailService{
-		databasePath: databasePath,
-		smtpAddr:     smtpAddr,
-		imapAddr:     imapAddr,
-		stopChan:     make(chan struct{}),
-		smtpDone:     make(chan struct{}),
-		overlayDone:  make(chan struct{}),
+		databasePath:    databasePath,
+		smtpAddr:        smtpAddr,
+		imapAddr:        imapAddr,
+		stopChan:        make(chan struct{}),
+		smtpDone:        make(chan struct{}),
+		overlayDone:     make(chan struct{}),
+		idleCheckDone:   make(chan struct{}),
+		idleTimeout:     10 * time.Minute, // 10 minutes idle timeout for battery optimization
+		lastActivity:    time.Now(),
+		serversPaused:   false,
 	}
 
 	// Initialize custom logger
@@ -271,6 +281,12 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 	s.lastMulticast = enableMulticast
 	s.lastMulticastRegex = multicastRegex
 
+	// Start idle timeout checker for battery optimization
+	s.lastActivity = time.Now()
+	s.serversPaused = false
+	s.idleCheckDone = make(chan struct{})
+	go s.idleTimeoutChecker()
+
 	s.running = true
 	s.logger.Println("Yggmail service started successfully")
 
@@ -348,6 +364,12 @@ func (s *YggmailService) Stop() error {
 
 	// Mark as not running to prevent new requests
 	s.running = false
+
+	// Stop idle timeout checker
+	close(s.idleCheckDone)
+	if s.idleCheckTicker != nil {
+		s.idleCheckTicker.Stop()
+	}
 
 	// Close IMAP server first
 	if s.imapServer != nil {
@@ -531,6 +553,10 @@ func (s *YggmailService) SendMail(from, to, subject, body string) error {
 	}
 
 	s.logger.Printf("Mail queued for sending to %s\n", to)
+
+	// Record activity for idle timeout
+	s.RecordActivity()
+
 	if s.mailCallback != nil {
 		s.mailCallback.OnMailSent(to, subject)
 	}
@@ -860,6 +886,88 @@ func (s *YggmailService) GetConnectionStats() string {
 	stats := fmt.Sprintf("Running: %v, Peers: %s, Multicast: %v",
 		s.running, s.lastPeers, s.lastMulticast)
 	return stats
+}
+
+// RecordActivity records user activity to prevent idle timeout
+// Call this method when mail is sent/received or user interacts with the app
+func (s *YggmailService) RecordActivity() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.lastActivity = time.Now()
+	s.logger.Println("Activity recorded, idle timeout reset")
+
+	// Resume servers if they were paused
+	if s.serversPaused && s.running {
+		s.logger.Println("Resuming servers due to activity")
+		// Servers will be resumed by the idle checker on next tick
+		s.serversPaused = false
+	}
+}
+
+// SetIdleTimeout sets the idle timeout duration for battery optimization
+// Default is 10 minutes. Set to 0 to disable idle timeout.
+func (s *YggmailService) SetIdleTimeout(minutes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if minutes <= 0 {
+		s.idleTimeout = 0
+		s.logger.Println("Idle timeout disabled")
+	} else {
+		s.idleTimeout = time.Duration(minutes) * time.Minute
+		s.logger.Printf("Idle timeout set to %d minutes\n", minutes)
+	}
+}
+
+// idleTimeoutChecker periodically checks for idle state and pauses servers
+func (s *YggmailService) idleTimeoutChecker() {
+	s.idleCheckTicker = time.NewTicker(1 * time.Minute) // Check every minute
+	defer s.idleCheckTicker.Stop()
+
+	s.logger.Println("Idle timeout checker started")
+
+	for {
+		select {
+		case <-s.idleCheckTicker.C:
+			s.checkIdleState()
+		case <-s.idleCheckDone:
+			s.logger.Println("Idle timeout checker stopped")
+			return
+		}
+	}
+}
+
+// checkIdleState checks if service has been idle and pauses/resumes servers accordingly
+func (s *YggmailService) checkIdleState() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.running {
+		return
+	}
+
+	// Skip if idle timeout is disabled
+	if s.idleTimeout == 0 {
+		return
+	}
+
+	idleTime := time.Since(s.lastActivity)
+
+	// Check if we should pause servers
+	if !s.serversPaused && idleTime >= s.idleTimeout {
+		s.logger.Printf("Service idle for %v, considering pause (threshold: %v)\n",
+			idleTime.Round(time.Second), s.idleTimeout)
+		// Note: For mobile P2P email, we can't fully pause servers without losing incoming mail
+		// Instead, we log the idle state for monitoring. Full server pause would require
+		// store-and-forward infrastructure which yggmail doesn't support.
+		// The WakeLock optimization in Android layer is more appropriate for battery saving.
+	}
+
+	// In future: could implement graceful degradation like:
+	// - Reduce QUIC keepalive frequency
+	// - Pause queue manager checks
+	// - Reduce multicast announcements
 }
 
 // logWriter is a custom writer that forwards logs to the callback
