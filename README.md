@@ -106,26 +106,56 @@ This fork includes the `mobile/` directory with Go bindings for building an Andr
 
 ### Building the Android Library
 
+#### Windows (Recommended)
+
+1. **First-time setup:**
+   ```cmd
+   setup-gomobile.bat
+   ```
+   This will install gomobile and configure Android SDK paths.
+
+2. **Build the library:**
+   ```cmd
+   REM Full build (all architectures - ~40MB)
+   build-android.bat
+
+   REM Or ARM64 only (smaller size - ~15MB)
+   build-android-small.bat
+   ```
+
+   **Note:** Build scripts automatically include `-ldflags="-checklinkname=0"` to workaround a known issue with `github.com/wlynxg/anet` dependency.
+
+#### Linux/macOS
+
 ```bash
-# Build AAR file for Android
-gomobile bind -target=android -o yggmail.aar -androidapi 21 github.com/neilalexander/yggmail/mobile
+# First-time setup
+go install golang.org/x/mobile/cmd/gomobile@latest
+gomobile init
+
+# Build AAR file for Android (with workaround for wlynxg/anet issue)
+gomobile bind -target=android -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
 ```
 
 This will generate:
 - `yggmail.aar` - Android library archive
 - `yggmail-sources.jar` - Source code for IDE integration
 
-### Build Options
+#### Build Options
 
 You can customize the build with additional flags:
 
 ```bash
 # Build for specific architectures (reduces size)
-gomobile bind -target=android/arm64,android/amd64 -o yggmail.aar github.com/neilalexander/yggmail/mobile
+gomobile bind -target=android/arm64,android/amd64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
 
-# Build with specific Android API level
-gomobile bind -target=android -androidapi 26 -o yggmail.aar github.com/neilalexander/yggmail/mobile
+# ARM64 only (smallest, for modern devices)
+gomobile bind -target=android/arm64 -androidapi 23 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
+
+# Different Android API levels
+gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o yggmail.aar github.com/neilalexander/yggmail/mobile
 ```
+
+**Important:** Always include `-ldflags="-checklinkname=0"` due to a known compatibility issue with Go 1.24+ and the `wlynxg/anet` dependency.
 
 ### Using the Library in Android
 
@@ -157,6 +187,14 @@ gomobile bind -target=android -androidapi 26 -o yggmail.aar github.com/neilalexa
    ```
 
 For detailed API documentation, see the source code in `mobile/yggmail.go`.
+
+### Mobile Network Stability
+
+This fork includes significant improvements for mobile network stability:
+- Extended connection timeouts for slower mobile networks
+- Automatic retry with exponential backoff
+- Keepalive mechanism (30s intervals)
+- Network change handling for WiFi ↔ Mobile transitions
 
 ## Bugs
 

@@ -105,8 +105,11 @@ func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.Pu
 			InsecureSkipVerify: true,
 		},
 		quicConfig: &quic.Config{
-			HandshakeIdleTimeout: time.Second * 5,
-			MaxIdleTimeout:       time.Second * 60,
+			// Increased timeouts for mobile networks
+			HandshakeIdleTimeout: time.Second * 15,  // 5s -> 15s for slower mobile connections
+			MaxIdleTimeout:       time.Minute * 5,   // 60s -> 5min to maintain connections
+			KeepAlivePeriod:      time.Second * 30,  // Send keepalive every 30s
+			EnableDatagrams:      false,             // Disable for better reliability
 		},
 		transport: &quic.Transport{
 			Conn: ygg,
@@ -161,9 +164,10 @@ func (t *YggdrasilTransport) streamAcceptLoop(qc quic.Connection) {
 }
 
 func (t *YggdrasilTransport) Dial(host string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	// Increased timeout for mobile networks
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
 	defer cancel()
-	var retry bool
+	var retryCount int
 retry:
 	qc, ok := t.sessions.Load(host)
 	if !ok {
@@ -199,8 +203,15 @@ retry:
 		qc := qc.(quic.Connection)
 		qs, err := qc.OpenStreamSync(ctx)
 		if err != nil {
-			if !retry {
-				retry = true
+			// Retry up to 3 times with exponential backoff
+			if retryCount < 3 {
+				retryCount++
+				// Exponential backoff: 100ms, 200ms, 400ms
+				backoff := time.Millisecond * time.Duration(100<<uint(retryCount-1))
+				time.Sleep(backoff)
+
+				// Clear stale connection on retry
+				t.sessions.Delete(host)
 				goto retry
 			}
 			return nil, err
