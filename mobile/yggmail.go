@@ -54,10 +54,6 @@ type ConnectionCallback interface {
 	OnConnectionError(peer, errorMsg string)
 }
 
-// PeerDiscoveryCallback interface for multicast peer discovery
-type PeerDiscoveryCallback interface {
-	OnPeerDiscovered(peerURI string)
-}
 
 // YggmailService is the main service class for Android/iOS
 type YggmailService struct {
@@ -74,7 +70,6 @@ type YggmailService struct {
 	logCallback       LogCallback
 	mailCallback      MailCallback
 	connCallback      ConnectionCallback
-	discoveryCallback PeerDiscoveryCallback
 	running           bool
 	stopChan          chan struct{}
 	smtpDone          chan struct{}
@@ -84,8 +79,6 @@ type YggmailService struct {
 	smtpAddr          string
 	imapAddr          string
 	lastPeers         string
-	lastMulticast     bool
-	lastMulticastRegex string
 	// Idle timeout for battery optimization
 	lastActivity      time.Time
 	idleTimeout       time.Duration
@@ -98,10 +91,6 @@ type YggmailService struct {
 	heartbeatInterval time.Duration
 	isActive          bool // Track if user is actively using the app
 	lastMailActivity  time.Time
-	// Peer discovery monitoring
-	discoveryTicker   *time.Ticker
-	discoveryDone     chan struct{}
-	knownPeers        map[string]bool
 }
 
 // NewYggmailService creates a new instance of Yggmail service
@@ -161,13 +150,6 @@ func (s *YggmailService) SetConnectionCallback(callback ConnectionCallback) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.connCallback = callback
-}
-
-// SetPeerDiscoveryCallback sets the callback for peer discovery events
-func (s *YggmailService) SetPeerDiscoveryCallback(callback PeerDiscoveryCallback) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.discoveryCallback = callback
 }
 
 // Initialize initializes the service and creates/loads keys
@@ -230,9 +212,7 @@ func (s *YggmailService) Initialize() error {
 
 // Start starts the Yggmail service with Yggdrasil network connectivity
 // peers: comma-separated list of static peers (e.g., "tls://1.2.3.4:12345,tls://5.6.7.8:12345")
-// enableMulticast: enable LAN peer discovery
-// multicastRegex: regex for multicast interface filtering (default ".*")
-func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRegex string) error {
+func (s *YggmailService) Start(peers string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -244,10 +224,6 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 		return fmt.Errorf("service not initialized, call Initialize() first")
 	}
 
-	if multicastRegex == "" {
-		multicastRegex = ".*"
-	}
-
 	// Parse peers
 	var peerList []string
 	if peers != "" {
@@ -257,8 +233,8 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 		}
 	}
 
-	if !enableMulticast && len(peerList) == 0 {
-		return fmt.Errorf("must specify either static peers or enable multicast")
+	if len(peerList) == 0 {
+		return fmt.Errorf("must specify at least one static peer")
 	}
 
 	// Initialize Yggdrasil transport
@@ -268,26 +244,11 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 		s.config.PrivateKey,
 		s.config.PublicKey,
 		peerList,
-		enableMulticast,
-		multicastRegex,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create transport: %w", err)
 	}
 	s.transport = transport
-
-	// Setup peer discovery handler for multicast
-	s.knownPeers = make(map[string]bool)
-	s.transport.SetPeerDiscoveryHandler(func(peerURI string) {
-		s.mu.RLock()
-		callback := s.discoveryCallback
-		s.mu.RUnlock()
-
-		if callback != nil {
-			s.logger.Printf("Discovered new peer: %s\n", peerURI)
-			callback.OnPeerDiscovered(peerURI)
-		}
-	})
 
 	// Initialize SMTP queues
 	s.queues = smtpsender.NewQueues(s.config, s.logger, s.transport, s.storage)
@@ -322,8 +283,6 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 
 	// Store connection parameters for potential reconnection
 	s.lastPeers = peers
-	s.lastMulticast = enableMulticast
-	s.lastMulticastRegex = multicastRegex
 
 	// Start idle timeout checker for battery optimization
 	s.lastActivity = time.Now()
@@ -334,12 +293,6 @@ func (s *YggmailService) Start(peers string, enableMulticast bool, multicastRege
 	// Start heartbeat to keep IMAP IDLE connections alive
 	s.heartbeatDone = make(chan struct{})
 	go s.heartbeatSender()
-
-	// Start peer discovery monitoring if multicast is enabled
-	if enableMulticast {
-		s.discoveryDone = make(chan struct{})
-		go s.peerDiscoveryMonitor()
-	}
 
 	s.running = true
 	s.logger.Println("Yggmail service started successfully")
@@ -445,14 +398,6 @@ func (s *YggmailService) Stop() error {
 	close(s.heartbeatDone)
 	if s.heartbeatTicker != nil {
 		s.heartbeatTicker.Stop()
-	}
-
-	// Stop peer discovery monitor
-	if s.discoveryDone != nil {
-		close(s.discoveryDone)
-		if s.discoveryTicker != nil {
-			s.discoveryTicker.Stop()
-		}
 	}
 
 	// Close IMAP server first
@@ -932,8 +877,6 @@ func (s *YggmailService) OnNetworkChange() error {
 	s.mu.RLock()
 	running := s.running
 	peers := s.lastPeers
-	multicast := s.lastMulticast
-	multicastRegex := s.lastMulticastRegex
 	s.mu.RUnlock()
 
 	if !running {
@@ -959,8 +902,6 @@ func (s *YggmailService) OnNetworkChange() error {
 		s.config.PrivateKey,
 		s.config.PublicKey,
 		strings.Split(peers, ","),
-		multicast,
-		multicastRegex,
 	)
 	if err != nil {
 		s.mu.Unlock()
@@ -991,8 +932,8 @@ func (s *YggmailService) GetConnectionStats() string {
 		return "Service not running"
 	}
 
-	stats := fmt.Sprintf("Running: %v, Peers: %s, Multicast: %v",
-		s.running, s.lastPeers, s.lastMulticast)
+	stats := fmt.Sprintf("Running: %v, Peers: %s",
+		s.running, s.lastPeers)
 	return stats
 }
 
@@ -1102,7 +1043,6 @@ func (s *YggmailService) checkIdleState() {
 	// In future: could implement graceful degradation like:
 	// - Reduce QUIC keepalive frequency
 	// - Pause queue manager checks
-	// - Reduce multicast announcements
 }
 
 // heartbeatSender periodically sends IMAP IDLE notifications to keep connections alive
@@ -1172,36 +1112,6 @@ func (s *YggmailService) calculateAdaptiveInterval() time.Duration {
 	// Deep idle mode: No activity for long time
 	// Still need heartbeat but can be very infrequent
 	return 60 * time.Second
-}
-
-// peerDiscoveryMonitor monitors for new peer connections via multicast
-func (s *YggmailService) peerDiscoveryMonitor() {
-	// Check for new peers every 10 seconds
-	s.discoveryTicker = time.NewTicker(10 * time.Second)
-	defer s.discoveryTicker.Stop()
-
-	s.logger.Println("Peer discovery monitor started")
-
-	for {
-		select {
-		case <-s.discoveryTicker.C:
-			s.mu.RLock()
-			if s.transport != nil && s.knownPeers != nil {
-				transport := s.transport
-				knownPeers := s.knownPeers
-				s.mu.RUnlock()
-
-				// Check for new peers
-				transport.MonitorPeers(knownPeers)
-			} else {
-				s.mu.RUnlock()
-			}
-
-		case <-s.discoveryDone:
-			s.logger.Println("Peer discovery monitor stopped")
-			return
-		}
-	}
 }
 
 // sendHeartbeat sends a lightweight notification to IMAP IDLE clients
@@ -1303,7 +1213,7 @@ func (s *YggmailService) GetPeerConnectionsJSON() string {
 
 // UpdatePeers updates peer configuration without restarting the service
 // Uses Yggdrasil Core's AddPeer/RemovePeer methods for live updates
-func (s *YggmailService) UpdatePeers(peers string, enableMulticast bool, multicastRegex string) error {
+func (s *YggmailService) UpdatePeers(peers string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1391,8 +1301,6 @@ func (s *YggmailService) UpdatePeers(peers string, enableMulticast bool, multica
 
 	// Store new configuration
 	s.lastPeers = peers
-	s.lastMulticast = enableMulticast
-	s.lastMulticastRegex = multicastRegex
 
 	s.logger.Printf("Peer configuration updated successfully: %d peers configured\n", len(newPeerList))
 
