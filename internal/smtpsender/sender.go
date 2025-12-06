@@ -14,7 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"net/mail"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +27,14 @@ import (
 	"github.com/neilalexander/yggmail/internal/transport"
 	"github.com/neilalexander/yggmail/internal/utils"
 	"go.uber.org/atomic"
+)
+
+const (
+	// Battery-optimized retry strategy
+	MAX_RETRY_ATTEMPTS   = 10  // Maximum 10 retries before giving up
+	MIN_BACKOFF_SECONDS  = 5   // Start at 5 seconds
+	MAX_BACKOFF_SECONDS  = 300 // Cap at 5 minutes
+	BACKOFF_MULTIPLIER   = 2.0 // Exponential growth factor
 )
 
 type Queues struct {
@@ -110,31 +121,36 @@ func (qs *Queues) queueFor(server string) (*Queue, error) {
 }
 
 type Queue struct {
-	queues      *Queues
-	destination string
-	running     atomic.Bool
-	retryCount  int
-	lastAttempt time.Time
+	queues           *Queues
+	destination      string
+	running          atomic.Bool
+	retryCount       int
+	lastAttempt      time.Time
+	permanentFailure bool // Mark as permanently failed after max retries
 }
 
 func (q *Queue) run() {
 	defer q.running.Store(false)
 	defer q.queues.Storage.MailExpunge("Outbox") // nolint:errcheck
 
-	// Implement exponential backoff for mobile network stability
-	// Reduced delays for faster retry: 1s, 2s, 4s, 8s, 15s (max)
+	// Check if we've exceeded maximum retries
+	if q.retryCount >= MAX_RETRY_ATTEMPTS {
+		q.permanentFailure = true
+		q.queues.Log.Printf("[Battery Optimization] Message to %s permanently failed after %d attempts - stopping retries\n",
+			q.destination, q.retryCount)
+		// TODO: Move to "Failed" mailbox or notify user
+		return
+	}
+
+	// Battery-optimized exponential backoff with jitter
 	if !q.lastAttempt.IsZero() && q.retryCount > 0 {
-		var backoffSeconds int
-		if q.retryCount <= 4 {
-			backoffSeconds = 1 << uint(q.retryCount-1) // 1, 2, 4, 8
-		} else {
-			backoffSeconds = 15 // Cap at 15 seconds instead of 60
-		}
+		backoffSeconds := calculateBackoff(q.retryCount)
 		waitTime := time.Duration(backoffSeconds) * time.Second
 		elapsed := time.Since(q.lastAttempt)
 		if elapsed < waitTime {
 			remaining := waitTime - elapsed
-			q.queues.Log.Printf("Waiting %v before retry to %s (attempt %d)\n", remaining, q.destination, q.retryCount+1)
+			q.queues.Log.Printf("[Battery Optimization] Waiting %v before retry to %s (attempt %d/%d)\n",
+				remaining, q.destination, q.retryCount+1, MAX_RETRY_ATTEMPTS)
 			time.Sleep(remaining)
 		}
 	}
@@ -242,12 +258,97 @@ func (q *Queue) run() {
 
 			return nil
 		}(); err != nil {
-			q.retryCount++
-			q.queues.Log.Printf("Failed to send to %s (retry count: %d): %v\n", q.destination, q.retryCount, err)
-			// TODO: Send a mail to the inbox on the first instance?
+			// Classify error type for intelligent retry
+			if isNetworkError(err) {
+				q.retryCount++
+				q.queues.Log.Printf("[Battery Optimization] Network error sending to %s (retry %d/%d): %v\n",
+					q.destination, q.retryCount, MAX_RETRY_ATTEMPTS, err)
+
+				// CRITICAL: Stop retrying if we've hit the maximum
+				if q.retryCount >= MAX_RETRY_ATTEMPTS {
+					q.permanentFailure = true
+					q.queues.Log.Printf("[Battery Optimization] Message to %s permanently failed after %d attempts - stopping retries\n",
+						q.destination, q.retryCount)
+					// Delete from queue to prevent manager from retrying
+					q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID)
+					if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err == nil && !remaining {
+						q.queues.Storage.MailDelete("Outbox", ref.ID)
+					}
+					// TODO: Move to "Failed" mailbox or notify user
+					return
+				}
+			} else if isPermanentError(err) {
+				q.permanentFailure = true
+				q.queues.Log.Printf("[Battery Optimization] Permanent error sending to %s - stopping retries: %v\n",
+					q.destination, err)
+				// Delete from queue to prevent retries
+				q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID)
+				if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err == nil && !remaining {
+					q.queues.Storage.MailDelete("Outbox", ref.ID)
+				}
+				// TODO: Notify user of permanent failure
+				return
+			} else {
+				// Unknown error - treat as temporary
+				q.retryCount++
+				q.queues.Log.Printf("Failed to send to %s (retry %d/%d): %v\n",
+					q.destination, q.retryCount, MAX_RETRY_ATTEMPTS, err)
+
+				// CRITICAL: Stop retrying if we've hit the maximum
+				if q.retryCount >= MAX_RETRY_ATTEMPTS {
+					q.permanentFailure = true
+					q.queues.Log.Printf("[Battery Optimization] Message to %s permanently failed after %d attempts - stopping retries\n",
+						q.destination, q.retryCount)
+					// Delete from queue to prevent manager from retrying
+					q.queues.Storage.QueueDeleteDestinationForID(q.destination, ref.ID)
+					if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err == nil && !remaining {
+						q.queues.Storage.MailDelete("Outbox", ref.ID)
+					}
+					// TODO: Move to "Failed" mailbox or notify user
+					return
+				}
+			}
 		} else {
 			q.retryCount = 0 // Reset retry count on success
+			q.permanentFailure = false
 			q.queues.Log.Println("Sent mail from", ref.From, "to", q.destination)
 		}
 	}
+}
+
+// calculateBackoff calculates exponential backoff with jitter
+func calculateBackoff(retryCount int) int {
+	// Exponential backoff: 5, 10, 20, 40, 80, 160, 300, 300...
+	backoff := float64(MIN_BACKOFF_SECONDS) * math.Pow(BACKOFF_MULTIPLIER, float64(retryCount-1))
+
+	// Cap at maximum
+	if backoff > float64(MAX_BACKOFF_SECONDS) {
+		backoff = float64(MAX_BACKOFF_SECONDS)
+	}
+
+	// Add jitter (±20%) to prevent thundering herd
+	jitter := rand.Float64()*0.4 - 0.2 // -20% to +20%
+	backoff = backoff * (1.0 + jitter)
+
+	return int(backoff)
+}
+
+// isNetworkError checks if error is network-related (temporary)
+func isNetworkError(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "context deadline exceeded") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "no route to host") ||
+		strings.Contains(errStr, "Transport.Dial") ||
+		strings.Contains(errStr, "i/o timeout")
+}
+
+// isPermanentError checks if error is permanent (don't retry)
+func isPermanentError(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "invalid address") ||
+		strings.Contains(errStr, "mailbox not found") ||
+		strings.Contains(errStr, "permanent failure") ||
+		strings.Contains(errStr, "recipient rejected")
 }
