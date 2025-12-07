@@ -1,4 +1,4 @@
-# Yggmail (Android Fork)
+# Yggmail (Fork)
 
 It's email, but not as you know it.
 
