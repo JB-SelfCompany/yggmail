@@ -98,7 +98,7 @@ func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.Pu
 	// This reduces packet count from 172,800/day to 1,440/day in background mode
 	quicConfig := getAdaptiveQUICConfig(isActive, isCharging)
 
-	yq, err := yggquic.New(ygg, *cfg.Certificate, quicConfig, 300)
+	yq, err := yggquic.New(ygg, quicConfig)
 	if err != nil {
 		panic(err)
 	}

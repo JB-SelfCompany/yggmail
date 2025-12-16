@@ -11,11 +11,14 @@ package mobile
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/mail"
 	"net/url"
 	"os"
@@ -25,6 +28,7 @@ import (
 
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
+	"github.com/JB-SelfCompany/yggpeers"
 	"github.com/neilalexander/yggmail/internal/config"
 	"github.com/neilalexander/yggmail/internal/imapserver"
 	"github.com/neilalexander/yggmail/internal/smtpsender"
@@ -52,6 +56,18 @@ type ConnectionCallback interface {
 	OnConnected(peer string)
 	OnDisconnected(peer string)
 	OnConnectionError(peer, errorMsg string)
+}
+
+// PeerDiscoveryCallback - асинхронный поиск пиров
+type PeerDiscoveryCallback interface {
+	OnProgress(current, total, availableCount int)
+	OnPeerAvailable(peerJSON string) // JSON одного пира
+}
+
+// PeerCheckCallback - проверка пользовательских пиров
+type PeerCheckCallback interface {
+	OnPeerChecked(uri string, available bool, rttMs int64)
+	OnCheckComplete(available, total int)
 }
 
 
@@ -92,6 +108,11 @@ type YggmailService struct {
 	isActive          bool // Track if user is actively using the app
 	isCharging        bool // Track if device is charging (for adaptive power management)
 	lastMailActivity  time.Time
+	// Peer discovery
+	peerManager       *yggpeers.Manager
+	peerBatchSize     int
+	peerConcurrency   int
+	peerPauseMs       int
 }
 
 // NewYggmailService creates a new instance of Yggmail service
@@ -124,6 +145,12 @@ func NewYggmailService(databasePath, smtpAddr, imapAddr string) (*YggmailService
 		serversPaused:     false,
 		heartbeatInterval: 30 * time.Second, // Start with conservative 30 seconds
 		isActive:          true,
+		// Peer discovery defaults (optimal for most mobile/home connections 10-100 Mbps)
+		// Uses default batching parameters from yggpeers library
+		peerManager:       yggpeers.NewManager(yggpeers.WithCacheTTL(24 * time.Hour), yggpeers.WithTimeout(5*time.Second)),
+		peerBatchSize:     yggpeers.DefaultBatchSize,
+		peerConcurrency:   yggpeers.DefaultConcurrency,
+		peerPauseMs:       yggpeers.DefaultBatchPauseMs,
 	}
 
 	// Initialize custom logger
@@ -1420,6 +1447,356 @@ func (s *YggmailService) UpdatePeers(peers string) error {
 	s.logger.Printf("Peer configuration updated successfully: %d peers configured\n", len(newPeerList))
 
 	return nil
+}
+
+// SetPeerBatchingParams sets batching parameters for peer discovery
+// Recommended settings from yggpeers library:
+// - Default (mobile/home 10-100 Mbps): batchSize=10, concurrency=10, pauseMs=100
+// - Fast WiFi (100+ Mbps): batchSize=20, concurrency=15, pauseMs=50
+// - Slow Mobile (< 10 Mbps): batchSize=5, concurrency=5, pauseMs=200
+func (s *YggmailService) SetPeerBatchingParams(batchSize, concurrency, pauseMs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.peerBatchSize = batchSize
+	s.peerConcurrency = concurrency
+	s.peerPauseMs = pauseMs
+	s.logger.Printf("Peer batching params updated: batchSize=%d, concurrency=%d, pauseMs=%d\n",
+		batchSize, concurrency, pauseMs)
+}
+
+// FindBestPeers finds N best peers synchronously
+// protocols: comma-separated "tcp,tls,quic,ws,wss,unix,socks,sockstls" (empty = all protocols)
+// Returns JSON array of peers
+func (s *YggmailService) FindBestPeers(count int, protocols string) (string, error) {
+	s.mu.RLock()
+	manager := s.peerManager
+	s.mu.RUnlock()
+
+	if manager == nil {
+		return "", fmt.Errorf("peer manager not initialized")
+	}
+
+	// Parse protocols
+	var protoList []yggpeers.Protocol
+	if protocols != "" {
+		for _, p := range strings.Split(protocols, ",") {
+			protoList = append(protoList, yggpeers.Protocol(strings.TrimSpace(p)))
+		}
+	}
+
+	filter := &yggpeers.FilterOptions{
+		Protocols:     protoList,
+		OnlyAvailable: true,
+		MaxRTT:        5 * time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Get available peers (this will check them)
+	peers, err := manager.GetAvailablePeers(ctx, filter)
+	if err != nil {
+		return "", fmt.Errorf("failed to get available peers: %w", err)
+	}
+
+	// Sort and limit
+	sorted := manager.FilterPeers(peers, filter, yggpeers.SortByRTT)
+	if len(sorted) > count {
+		sorted = sorted[:count]
+	}
+
+	// Convert to JSON
+	return peersToJSON(sorted)
+}
+
+// FindAvailablePeersAsync finds peers asynchronously with callbacks
+// protocols: comma-separated "tcp,tls,quic,ws,wss,unix,socks,sockstls" (empty = all)
+// region: filter by region (empty = all)
+// maxRTTMs: maximum RTT in milliseconds (0 = no limit)
+func (s *YggmailService) FindAvailablePeersAsync(protocols, region string, maxRTTMs int, callback PeerDiscoveryCallback) {
+	go func() {
+		s.mu.RLock()
+		manager := s.peerManager
+		batchSize := s.peerBatchSize
+		concurrency := s.peerConcurrency
+		pauseMs := s.peerPauseMs
+		s.mu.RUnlock()
+
+		if manager == nil {
+			s.logger.Println("Peer manager not initialized")
+			return
+		}
+
+		// Parse protocols
+		var protoList []yggpeers.Protocol
+		if protocols != "" {
+			for _, p := range strings.Split(protocols, ",") {
+				protoList = append(protoList, yggpeers.Protocol(strings.TrimSpace(p)))
+			}
+		}
+
+		// Parse region
+		var regionList []string
+		if region != "" {
+			regionList = []string{region}
+		}
+
+		filter := &yggpeers.FilterOptions{
+			Protocols: protoList,
+			Regions:   regionList,
+			OnlyUp:    true,
+		}
+
+		if maxRTTMs > 0 {
+			filter.MaxRTT = time.Duration(maxRTTMs) * time.Millisecond
+		} else {
+			filter.MaxRTT = 5 * time.Second
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		// Get all peers
+		allPeers, err := manager.GetPeers(ctx)
+		if err != nil {
+			s.logger.Printf("Failed to fetch peers: %v\n", err)
+			callback.OnProgress(0, 0, 0)
+			return
+		}
+
+		// Pre-filter by protocol and region
+		filtered := manager.FilterPeers(allPeers, filter, yggpeers.SortByRTT)
+		total := len(filtered)
+
+		callback.OnProgress(0, total, 0)
+
+		// Check peers in batches
+		available := 0
+		for i := 0; i < total; i += batchSize {
+			end := i + batchSize
+			if end > total {
+				end = total
+			}
+
+			batch := filtered[i:end]
+
+			// Check batch
+			err := manager.CheckPeers(ctx, batch, concurrency)
+			if err != nil {
+				s.logger.Printf("Error checking batch: %v\n", err)
+			}
+
+			// Report progress and available peers
+			for _, peer := range batch {
+				if peer.Available && matchesMaxRTT(peer, filter.MaxRTT) {
+					available++
+					// Convert peer to JSON and send
+					if peerJSON, err := peerToJSON(peer); err == nil {
+						callback.OnPeerAvailable(peerJSON)
+					}
+				}
+			}
+
+			callback.OnProgress(end, total, available)
+
+			// Pause between batches (battery optimization)
+			if end < total && pauseMs > 0 {
+				time.Sleep(time.Duration(pauseMs) * time.Millisecond)
+			}
+		}
+
+		s.logger.Printf("Peer discovery complete: %d available out of %d checked\n", available, total)
+	}()
+}
+
+// CheckCustomPeersAsync checks user-provided peers asynchronously
+// peersJSON: JSON array of peer URIs ["tls://host:port", ...]
+func (s *YggmailService) CheckCustomPeersAsync(peersJSON string, callback PeerCheckCallback) {
+	go func() {
+		s.mu.RLock()
+		manager := s.peerManager
+		concurrency := s.peerConcurrency
+		s.mu.RUnlock()
+
+		if manager == nil {
+			s.logger.Println("Peer manager not initialized")
+			return
+		}
+
+		// Parse JSON array
+		var uris []string
+		if err := json.Unmarshal([]byte(peersJSON), &uris); err != nil {
+			s.logger.Printf("Failed to parse peers JSON: %v\n", err)
+			callback.OnCheckComplete(0, 0)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		// Convert URIs to peers
+		peers := make([]*yggpeers.Peer, 0, len(uris))
+		for _, uri := range uris {
+			if peer, err := parsePeerURI(uri); err == nil {
+				peers = append(peers, peer)
+			}
+		}
+
+		total := len(peers)
+
+		// Check all peers
+		err := manager.CheckPeers(ctx, peers, concurrency)
+		if err != nil {
+			s.logger.Printf("Error checking custom peers: %v\n", err)
+		}
+
+		// Report results
+		available := 0
+		for _, peer := range peers {
+			callback.OnPeerChecked(peer.Address, peer.Available, peer.RTT.Milliseconds())
+			if peer.Available {
+				available++
+			}
+		}
+
+		callback.OnCheckComplete(available, total)
+		s.logger.Printf("Custom peer check complete: %d/%d available\n", available, total)
+	}()
+}
+
+// GetAvailableRegions returns JSON array of available regions
+func (s *YggmailService) GetAvailableRegions() (string, error) {
+	s.mu.RLock()
+	manager := s.peerManager
+	s.mu.RUnlock()
+
+	if manager == nil {
+		return "", fmt.Errorf("peer manager not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	peers, err := manager.GetPeers(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get peers: %w", err)
+	}
+
+	// Extract unique regions
+	regionMap := make(map[string]bool)
+	for _, peer := range peers {
+		if peer.Region != "" {
+			regionMap[peer.Region] = true
+		}
+	}
+
+	regions := make([]string, 0, len(regionMap))
+	for region := range regionMap {
+		regions = append(regions, region)
+	}
+
+	// Convert to JSON
+	data, err := json.Marshal(regions)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal regions: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// Helper functions
+
+func peersToJSON(peers []*yggpeers.Peer) (string, error) {
+	type PeerJSON struct {
+		Address    string `json:"address"`
+		Protocol   string `json:"protocol"`
+		Region     string `json:"region"`
+		RTT        int64  `json:"rtt"`
+		Available  bool   `json:"available"`
+		ResponseMS int    `json:"response_ms"`
+		LastSeen   int64  `json:"last_seen"`
+	}
+
+	result := make([]PeerJSON, len(peers))
+	for i, p := range peers {
+		result[i] = PeerJSON{
+			Address:    p.Address,
+			Protocol:   string(p.Protocol),
+			Region:     p.Region,
+			RTT:        p.RTT.Milliseconds(),
+			Available:  p.Available,
+			ResponseMS: p.ResponseMS,
+			LastSeen:   p.LastSeen,
+		}
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
+}
+
+func peerToJSON(peer *yggpeers.Peer) (string, error) {
+	type PeerJSON struct {
+		Address    string `json:"address"`
+		Protocol   string `json:"protocol"`
+		Region     string `json:"region"`
+		RTT        int64  `json:"rtt"`
+		Available  bool   `json:"available"`
+		ResponseMS int    `json:"response_ms"`
+		LastSeen   int64  `json:"last_seen"`
+	}
+
+	p := PeerJSON{
+		Address:    peer.Address,
+		Protocol:   string(peer.Protocol),
+		Region:     peer.Region,
+		RTT:        peer.RTT.Milliseconds(),
+		Available:  peer.Available,
+		ResponseMS: peer.ResponseMS,
+		LastSeen:   peer.LastSeen,
+	}
+
+	data, err := json.Marshal(p)
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
+}
+
+func matchesMaxRTT(peer *yggpeers.Peer, maxRTT time.Duration) bool {
+	if maxRTT == 0 {
+		return true
+	}
+	return peer.RTT <= maxRTT
+}
+
+func parsePeerURI(uri string) (*yggpeers.Peer, error) {
+	// Parse protocol from URI (e.g., "tls://host:port")
+	parts := strings.SplitN(uri, "://", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid URI format: %s", uri)
+	}
+
+	protocol := yggpeers.Protocol(parts[0])
+	hostPort := parts[1]
+
+	// Extract host and port
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return nil, fmt.Errorf("invalid host:port: %w", err)
+	}
+
+	return &yggpeers.Peer{
+		Address:  uri,
+		Protocol: protocol,
+		Host:     host,
+		Port:     port,
+	}, nil
 }
 
 // logWriter is a custom writer that forwards logs to the callback

@@ -1,8 +1,9 @@
 module github.com/neilalexander/yggmail
 
-go 1.25.1
+go 1.25.5
 
 require (
+	github.com/JB-SelfCompany/yggpeers v0.0.0-20251216174745-cdf3f5f8f68d
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-imap-idle v0.0.0-20210907174914-db2568431445
 	github.com/emersion/go-imap-move v0.0.0-20210907172020-fe4558f9c872
@@ -27,14 +28,13 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.0 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/emersion/go-textwrapper v0.0.0-20200911093747-65d896831594 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hjson/hjson-go/v4 v4.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/mobile v0.0.0-20251126181937-5c265dc024c4 // indirect
+	github.com/neilalexander/generique v0.0.0-20251127000013-def6a5bd842a // indirect
+	golang.org/x/mobile v0.0.0-20251209145715-2553ed8ce294 // indirect
 	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 )
-
-replace github.com/yggdrasil-network/yggquic => ../yggquic
