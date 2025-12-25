@@ -34,6 +34,7 @@ import (
 	"github.com/JB-SelfCompany/yggmail/internal/storage/sqlite3"
 	"github.com/JB-SelfCompany/yggmail/internal/transport"
 	"github.com/JB-SelfCompany/yggmail/internal/utils"
+	"github.com/JB-SelfCompany/yggmail/internal/welcome"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -59,7 +60,7 @@ func main() {
 	smtpaddr := flag.String("smtp", "localhost:1025", "SMTP listen address")
 	imapaddr := flag.String("imap", "localhost:1143", "IMAP listen address")
 	multicast := flag.Bool("multicast", false, "Connect to Yggdrasil peers on your LAN")
-        _ = flag.String("mcastregexp", ".*", "Regexp for multicast")
+	_ = flag.String("mcastregexp", ".*", "Regexp for multicast")
 	password := flag.Bool("password", false, "Set a new IMAP/SMTP password")
 	passwordhash := flag.String("passwordhash", "", "Set a new IMAP/SMTP password (hash)")
 	flag.Var(&peerAddrs, "peer", "Connect to a specific Yggdrasil static peer (this option can be given more than once)")
@@ -79,7 +80,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer storage.Close()
+	defer storage.Close() // nolint:errcheck
 	log.Printf("Using database file %q\n", *database)
 
 	skStr, err := storage.ConfigGet("private_key")
@@ -106,11 +107,14 @@ func main() {
 	pk := sk.Public().(ed25519.PublicKey)
 	log.Printf("Mail address: %s@%s\n", hex.EncodeToString(pk), utils.Domain)
 
-	for _, name := range []string{"INBOX", "Outbox"} {
+	for _, name := range []string{"INBOX", "Outbox", "Sent"} {
 		if err := storage.MailboxCreate(name); err != nil {
 			panic(err)
 		}
 	}
+
+	// Perform onboarding (send welcome message on first run)
+	welcome.Onboard(hex.EncodeToString(pk), storage, log)
 
 	// Database migrations are now run automatically in NewSQLite3StorageStorage()
 
@@ -162,19 +166,19 @@ func main() {
 		os.Exit(0)
 
 	case passwordhash != nil && *passwordhash != "":
-		var hash string = strings.TrimSpace(*passwordhash);
+		var hash = strings.TrimSpace(*passwordhash)
 		if len(hash) == 0 {
-			log.Println("Password hash cannot be blank");
-			os.Exit(1);
+			log.Println("Password hash cannot be blank")
+			os.Exit(1)
 		}
 
-		log.Printf("Using password hash: '%v'\n", hash);
+		log.Printf("Using password hash: '%v'\n", hash)
 
 		if _, err := bcrypt.Cost(([]byte)(hash)); err != nil {
-			log.Printf("The provided hash is invalid %v\n", err);
-			os.Exit(1);
+			log.Printf("The provided hash is invalid %v\n", err)
+			os.Exit(1)
 		} else if err := storage.ConfigSetPassword(hash); err != nil {
-			log.Println("Failed to set password: ", err);
+			log.Println("Failed to set password: ", err)
 			os.Exit(1)
 		}
 

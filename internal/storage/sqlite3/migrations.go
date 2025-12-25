@@ -224,7 +224,7 @@ func MigrateLargeMessagesToFiles(db *sql.DB, fs *filestore.FileStore, threshold 
 	if err != nil {
 		return fmt.Errorf("failed to query large messages: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint:errcheck
 
 	migratedCount := 0
 	var totalSize int64

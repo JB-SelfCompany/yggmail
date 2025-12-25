@@ -94,7 +94,7 @@ func (w *Writer) Do(db *sql.DB, txn *sql.Tx, f func(txn *sql.Tx) error) error {
 }
 
 func (w *Writer) run() {
-	if !w.running.CAS(false, true) {
+	if !w.running.CompareAndSwap(false, true) {
 		return
 	}
 	defer w.running.Store(false)

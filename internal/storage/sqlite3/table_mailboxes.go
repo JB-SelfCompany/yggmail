@@ -110,7 +110,7 @@ func (t *TableMailboxes) MailboxList(onlySubscribed bool) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("t.listMailboxes.Query: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint:errcheck
 	var mailboxes []string
 	for rows.Next() {
 		var mailbox string

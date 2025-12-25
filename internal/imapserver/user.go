@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
@@ -21,6 +22,7 @@ type User struct {
 	backend  *Backend
 	username string
 	conn     *imap.ConnInfo
+	log      *log.Logger
 }
 
 func (u *User) Username() string {
@@ -64,23 +66,26 @@ func (u *User) GetMailbox(name string) (mailbox backend.Mailbox, err error) {
 }
 
 func (u *User) CreateMailbox(name string) error {
+	u.log.Printf("Creating mailbox %q\n", name)
 	return u.backend.Storage.MailboxCreate(name)
 }
 
 func (u *User) DeleteMailbox(name string) error {
 	switch name {
-	case "INBOX", "Outbox":
+	case "INBOX", "Outbox", "Sent":
 		return errors.New("Cannot delete " + name)
 	default:
+		u.log.Printf("Deleting mailbox %q\n", name)
 		return u.backend.Storage.MailboxDelete(name)
 	}
 }
 
 func (u *User) RenameMailbox(existingName, newName string) error {
 	switch existingName {
-	case "INBOX", "Outbox":
+	case "INBOX", "Outbox", "Sent":
 		return errors.New("Cannot rename " + existingName)
 	default:
+		u.log.Printf("Renaming mailbox %q to %q\n", existingName, newName)
 		return u.backend.Storage.MailboxRename(existingName, newName)
 	}
 }

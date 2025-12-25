@@ -327,7 +327,7 @@ func (q *Queue) run() {
 				if err != nil {
 					deliveryErr = fmt.Errorf("failed to read mail file: %w", err)
 				} else {
-					defer file.Close()
+					defer file.Close() // nolint:errcheck
 					_, deliveryErr = q.queues.Storage.MailCreateFromStream("INBOX", file, q.queues.FileStore)
 				}
 			} else {
@@ -349,8 +349,13 @@ func (q *Queue) run() {
 			if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err != nil {
 				q.queues.Log.Printf("Failed to check pending: %v\n", err)
 			} else if !remaining {
-				// Delete from Outbox - this will also delete the file if it's the last reference
-				q.queues.Storage.MailDelete("Outbox", ref.ID)
+				// Move from Outbox to Sent - preserves the message for record keeping
+				if q.queues.FileStore != nil {
+					q.queues.Storage.MailMoveWithFileStore("Outbox", ref.ID, "Sent", q.queues.FileStore)
+				} else {
+					q.queues.Storage.MailMove("Outbox", ref.ID, "Sent")
+				}
+				q.queues.Log.Printf("Moved mail %d from Outbox to Sent\n", ref.ID)
 			}
 
 			q.retryCount = 0
@@ -378,7 +383,7 @@ func (q *Queue) run() {
 				mailReader = io.NopCloser(bytes.NewReader(mail.Mail))
 				mailSize = int64(len(mail.Mail))
 			}
-			defer mailReader.Close()
+			defer mailReader.Close() // nolint:errcheck
 
 			// Start large mail logging if needed
 			var opID string
@@ -396,7 +401,7 @@ func (q *Queue) run() {
 				}
 				return fmt.Errorf("q.queues.Transport.Dial: %w", err)
 			}
-			defer conn.Close()
+			defer conn.Close() // nolint:errcheck
 
 			client, err := smtp.NewClient(conn, q.destination)
 			if err != nil {
@@ -405,7 +410,7 @@ func (q *Queue) run() {
 				}
 				return fmt.Errorf("smtp.NewClient: %w", err)
 			}
-			defer client.Close()
+			defer client.Close() // nolint:errcheck
 
 			// Enable debug logging for SMTP protocol to diagnose SIZE extension issue
 			if false { // Set to true to enable detailed SMTP client protocol logging
@@ -475,7 +480,7 @@ func (q *Queue) run() {
 				}
 				return fmt.Errorf("client.Data: %w", err)
 			}
-			defer writer.Close()
+			defer writer.Close() // nolint:errcheck
 
 			// Streaming send with chunking and progress logging
 			buffer := make([]byte, types.ChunkSize) // 128 KB chunks
@@ -527,8 +532,17 @@ func (q *Queue) run() {
 			if remaining, err := q.queues.Storage.QueueSelectIsMessagePendingSend("Outbox", ref.ID); err != nil {
 				return fmt.Errorf("q.queues.Storage.QueueSelectIsMessagePendingSend: %w", err)
 			} else if !remaining {
-				// Last recipient - delete from Outbox (this will also delete the file)
-				return q.queues.Storage.MailDelete("Outbox", ref.ID)
+				// Last recipient - move from Outbox to Sent (preserves the message for record keeping)
+				var moveErr error
+				if q.queues.FileStore != nil {
+					moveErr = q.queues.Storage.MailMoveWithFileStore("Outbox", ref.ID, "Sent", q.queues.FileStore)
+				} else {
+					moveErr = q.queues.Storage.MailMove("Outbox", ref.ID, "Sent")
+				}
+				if moveErr != nil {
+					return fmt.Errorf("failed to move mail to Sent: %w", moveErr)
+				}
+				q.queues.Log.Printf("Moved mail %d from Outbox to Sent\n", ref.ID)
 			}
 
 			return nil

@@ -98,7 +98,7 @@ func (t *TableQueue) QueueListDestinations() ([]string, error) {
 		}
 		return nil, fmt.Errorf("t.queueSelectDestinations.Query: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint:errcheck
 	var destinations []string
 	for rows.Next() {
 		var destination string
@@ -118,7 +118,7 @@ func (t *TableQueue) QueueMailIDsForDestination(destination string) ([]types.Que
 		}
 		return nil, fmt.Errorf("t.queueSelectDestinations.Query: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() // nolint:errcheck
 	var ids []types.QueuedMail
 	for rows.Next() {
 		var id int
