@@ -93,30 +93,30 @@ func (t *TableConfig) ConfigTryPassword(password string) (bool, error) {
 	return false, err
 }
 
-// ConfigGetUnreadQuota returns the unread messages quota in bytes
+// ConfigGetMaxMessageSize returns the maximum message size in bytes
 // Returns default of 10 MB if not set
-func (t *TableConfig) ConfigGetUnreadQuota() (int64, error) {
-	value, err := t.ConfigGet("unread_quota_bytes")
+func (t *TableConfig) ConfigGetMaxMessageSize() (int64, error) {
+	value, err := t.ConfigGet("max_message_size_bytes")
 	if err != nil {
-		return 0, fmt.Errorf("failed to get unread quota: %w", err)
+		return 0, fmt.Errorf("failed to get max message size: %w", err)
 	}
 	if value == "" {
 		// Default: 10 MB
 		return 10 * 1024 * 1024, nil
 	}
 
-	var quota int64
-	if _, err := fmt.Sscanf(value, "%d", &quota); err != nil {
-		return 0, fmt.Errorf("failed to parse quota value: %w", err)
+	var maxSize int64
+	if _, err := fmt.Sscanf(value, "%d", &maxSize); err != nil {
+		return 0, fmt.Errorf("failed to parse max message size value: %w", err)
 	}
-	return quota, nil
+	return maxSize, nil
 }
 
-// ConfigSetUnreadQuota sets the unread messages quota in bytes
-func (t *TableConfig) ConfigSetUnreadQuota(bytes int64) error {
+// ConfigSetMaxMessageSize sets the maximum message size in bytes
+func (t *TableConfig) ConfigSetMaxMessageSize(bytes int64) error {
 	if bytes < 0 {
-		return fmt.Errorf("quota cannot be negative")
+		return fmt.Errorf("max message size cannot be negative")
 	}
 	value := fmt.Sprintf("%d", bytes)
-	return t.ConfigSet("unread_quota_bytes", value)
+	return t.ConfigSet("max_message_size_bytes", value)
 }

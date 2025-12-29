@@ -20,8 +20,8 @@ type Storage interface {
 	ConfigSet(key, value string) error
 	ConfigSetPassword(password string) error
 	ConfigTryPassword(password string) (bool, error)
-	ConfigGetUnreadQuota() (int64, error)
-	ConfigSetUnreadQuota(bytes int64) error
+	ConfigGetMaxMessageSize() (int64, error)
+	ConfigSetMaxMessageSize(bytes int64) error
 
 	MailboxSelect(mailbox string) (bool, error)
 	MailNextID(mailbox string) (int, error)

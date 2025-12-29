@@ -1912,9 +1912,9 @@ func (s *YggmailService) GetMailSize(mailbox string, mailID int) (int64, error) 
 	return mailData.Size, nil
 }
 
-// SetUnreadQuotaMB sets the quota for unread messages in megabytes
-// This limits the total size of unread messages across all mailboxes
-func (s *YggmailService) SetUnreadQuotaMB(megabytes int64) error {
+// SetMaxMessageSizeMB sets the maximum message size in megabytes
+// This limits the size of individual messages that can be received
+func (s *YggmailService) SetMaxMessageSizeMB(megabytes int64) error {
 	s.mu.RLock()
 	storage := s.storage
 	s.mu.RUnlock()
@@ -1924,20 +1924,20 @@ func (s *YggmailService) SetUnreadQuotaMB(megabytes int64) error {
 	}
 
 	if megabytes < 0 {
-		return fmt.Errorf("quota cannot be negative")
+		return fmt.Errorf("max message size cannot be negative")
 	}
 
 	bytes := megabytes * 1024 * 1024
-	if err := storage.ConfigSetUnreadQuota(bytes); err != nil {
-		return fmt.Errorf("failed to set unread quota: %w", err)
+	if err := storage.ConfigSetMaxMessageSize(bytes); err != nil {
+		return fmt.Errorf("failed to set max message size: %w", err)
 	}
 
-	s.logger.Printf("Unread quota set to %d MB (%d bytes)\n", megabytes, bytes)
+	s.logger.Printf("Max message size set to %d MB (%d bytes)\n", megabytes, bytes)
 	return nil
 }
 
-// GetUnreadQuotaMB returns the current unread quota in megabytes
-func (s *YggmailService) GetUnreadQuotaMB() (int64, error) {
+// GetMaxMessageSizeMB returns the current maximum message size in megabytes
+func (s *YggmailService) GetMaxMessageSizeMB() (int64, error) {
 	s.mu.RLock()
 	storage := s.storage
 	s.mu.RUnlock()
@@ -1946,9 +1946,9 @@ func (s *YggmailService) GetUnreadQuotaMB() (int64, error) {
 		return 0, fmt.Errorf("service not initialized")
 	}
 
-	bytes, err := storage.ConfigGetUnreadQuota()
+	bytes, err := storage.ConfigGetMaxMessageSize()
 	if err != nil {
-		return 0, fmt.Errorf("failed to get unread quota: %w", err)
+		return 0, fmt.Errorf("failed to get max message size: %w", err)
 	}
 
 	return bytes / (1024 * 1024), nil
@@ -1972,18 +1972,18 @@ func (s *YggmailService) GetUnreadSizeMB() (float64, error) {
 	return float64(bytes) / (1024 * 1024), nil
 }
 
-// UnreadQuotaInfo contains information about unread quota usage
-type UnreadQuotaInfo struct {
-	QuotaMB      int64   // Total quota in MB
-	UsedMB       float64 // Currently used space in MB
+// MaxMessageSizeInfo contains information about message size limits
+type MaxMessageSizeInfo struct {
+	MaxSizeMB    int64   // Maximum message size in MB
+	UsedMB       float64 // Currently used space in MB (unread messages)
 	FreeMB       float64 // Free space in MB
 	UsedPercent  float64 // Percentage used (0-100)
 	UnreadCount  int     // Number of unread messages
-	IsExceeded   bool    // True if quota is exceeded
+	IsExceeded   bool    // True if limit is exceeded
 }
 
-// GetUnreadQuotaInfo returns detailed information about unread quota usage
-func (s *YggmailService) GetUnreadQuotaInfo() (*UnreadQuotaInfo, error) {
+// GetMaxMessageSizeInfo returns detailed information about message size limits
+func (s *YggmailService) GetMaxMessageSizeInfo() (*MaxMessageSizeInfo, error) {
 	s.mu.RLock()
 	storage := s.storage
 	s.mu.RUnlock()
@@ -1992,10 +1992,10 @@ func (s *YggmailService) GetUnreadQuotaInfo() (*UnreadQuotaInfo, error) {
 		return nil, fmt.Errorf("service not initialized")
 	}
 
-	// Get quota
-	quotaBytes, err := storage.ConfigGetUnreadQuota()
+	// Get max message size
+	maxSizeBytes, err := storage.ConfigGetMaxMessageSize()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get quota: %w", err)
+		return nil, fmt.Errorf("failed to get max message size: %w", err)
 	}
 
 	// Get current unread size
@@ -2011,45 +2011,45 @@ func (s *YggmailService) GetUnreadQuotaInfo() (*UnreadQuotaInfo, error) {
 		unreadCount = 0
 	}
 
-	quotaMB := quotaBytes / (1024 * 1024)
+	maxSizeMB := maxSizeBytes / (1024 * 1024)
 	usedMB := float64(usedBytes) / (1024 * 1024)
-	freeMB := float64(quotaBytes-usedBytes) / (1024 * 1024)
+	freeMB := float64(maxSizeBytes-usedBytes) / (1024 * 1024)
 
 	var usedPercent float64
-	if quotaBytes > 0 {
-		usedPercent = (float64(usedBytes) / float64(quotaBytes)) * 100
+	if maxSizeBytes > 0 {
+		usedPercent = (float64(usedBytes) / float64(maxSizeBytes)) * 100
 	}
 
-	info := &UnreadQuotaInfo{
-		QuotaMB:     quotaMB,
+	info := &MaxMessageSizeInfo{
+		MaxSizeMB:   maxSizeMB,
 		UsedMB:      usedMB,
 		FreeMB:      freeMB,
 		UsedPercent: usedPercent,
 		UnreadCount: unreadCount,
-		IsExceeded:  usedBytes > quotaBytes,
+		IsExceeded:  usedBytes > maxSizeBytes,
 	}
 
 	return info, nil
 }
 
-// QuotaCheckResult represents the result of recipient quota check
-type QuotaCheckResult struct {
-	CanSend       bool    // Whether message can be sent (quota sufficient)
+// MessageSizeLimitCheckResult represents the result of recipient message size limit check
+type MessageSizeLimitCheckResult struct {
+	CanSend       bool    // Whether message can be sent (size within limit)
 	ErrorMessage  string  // Error message if CanSend is false
 	RecipientAddr string  // Recipient address checked
 	MessageSizeMB float64 // Message size in MB
 }
 
-// CheckRecipientQuota checks if recipient has enough quota to receive the message.
+// CheckRecipientMessageSizeLimit checks if recipient can accept a message of given size.
 // This should be called BEFORE sending in 1-on-1 chats to avoid wasting bandwidth.
-// For group chats, skip this check - send to all, those with quota will accept.
+// For group chats, skip this check - send to all, those with capacity will accept.
 //
 // Parameters:
 //   - recipientEmail: Full email address (e.g., "abc123...@yggmail")
 //   - messageSizeBytes: Size of message to send in bytes
 //
-// Returns QuotaCheckResult with CanSend=true if quota is sufficient, false otherwise.
-func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeBytes int64) (*QuotaCheckResult, error) {
+// Returns MessageSizeLimitCheckResult with CanSend=true if message size is acceptable, false otherwise.
+func (s *YggmailService) CheckRecipientMessageSizeLimit(recipientEmail string, messageSizeBytes int64) (*MessageSizeLimitCheckResult, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2066,12 +2066,12 @@ func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeB
 	recipientHex := hex.EncodeToString(recipientPubKey)
 	messageSizeMB := float64(messageSizeBytes) / (1024 * 1024)
 
-	s.logger.Printf("Checking quota for recipient %s, message size %.2f MB", recipientHex[:8], messageSizeMB)
+	s.logger.Printf("Checking message size limit for recipient %s, message size %.2f MB", recipientHex[:8], messageSizeMB)
 
 	// Connect to recipient's server
 	conn, err := s.transport.Dial(recipientHex)
 	if err != nil {
-		return &QuotaCheckResult{
+		return &MessageSizeLimitCheckResult{
 			CanSend:       false,
 			ErrorMessage:  fmt.Sprintf("Cannot connect to recipient: %v", err),
 			RecipientAddr: recipientEmail,
@@ -2083,7 +2083,7 @@ func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeB
 	// Create SMTP client
 	client, err := smtp.NewClient(conn, recipientHex)
 	if err != nil {
-		return &QuotaCheckResult{
+		return &MessageSizeLimitCheckResult{
 			CanSend:       false,
 			ErrorMessage:  fmt.Sprintf("SMTP connection failed: %v", err),
 			RecipientAddr: recipientEmail,
@@ -2095,7 +2095,7 @@ func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeB
 	// Send EHLO
 	ourAddr := hex.EncodeToString(s.config.PublicKey) + "@yggmail"
 	if err := client.Hello(hex.EncodeToString(s.config.PublicKey)); err != nil {
-		return &QuotaCheckResult{
+		return &MessageSizeLimitCheckResult{
 			CanSend:       false,
 			ErrorMessage:  fmt.Sprintf("EHLO failed: %v", err),
 			RecipientAddr: recipientEmail,
@@ -2106,10 +2106,10 @@ func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeB
 	// Check if SIZE extension is supported
 	sizeSupported, sizeParam := client.Extension("SIZE")
 	if !sizeSupported {
-		s.logger.Printf("WARNING: Recipient %s does not support SIZE extension, cannot check quota", recipientHex[:8])
-		// If SIZE not supported, we can't check quota - allow sending
-		// The quota will be checked during actual DATA transfer
-		return &QuotaCheckResult{
+		s.logger.Printf("WARNING: Recipient %s does not support SIZE extension, cannot check message size limit", recipientHex[:8])
+		// If SIZE not supported, we can't check limit - allow sending
+		// The limit will be checked during actual DATA transfer
+		return &MessageSizeLimitCheckResult{
 			CanSend:       true,
 			ErrorMessage:  "",
 			RecipientAddr: recipientEmail,
@@ -2119,28 +2119,28 @@ func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeB
 
 	s.logger.Printf("Recipient %s supports SIZE extension (max=%s)", recipientHex[:8], sizeParam)
 
-	// Try MAIL FROM with SIZE parameter - this will trigger quota check on recipient
+	// Try MAIL FROM with SIZE parameter - this will trigger size limit check on recipient
 	mailOpts := &smtp.MailOptions{
 		Size: int(messageSizeBytes),
 	}
 
 	err = client.Mail(ourAddr, mailOpts)
 	if err != nil {
-		// Check if it's a quota error (552 code)
+		// Check if it's a size limit error (552 code)
 		if smtpErr, ok := err.(*smtp.SMTPError); ok {
 			if smtpErr.Code == 552 {
-				// Quota exceeded!
-				s.logger.Printf("Recipient %s quota exceeded: %s", recipientHex[:8], smtpErr.Message)
-				return &QuotaCheckResult{
+				// Size limit exceeded!
+				s.logger.Printf("Recipient %s message size limit exceeded: %s", recipientHex[:8], smtpErr.Message)
+				return &MessageSizeLimitCheckResult{
 					CanSend:       false,
-					ErrorMessage:  fmt.Sprintf("Recipient quota exceeded: %s", smtpErr.Message),
+					ErrorMessage:  fmt.Sprintf("Recipient message size limit exceeded: %s", smtpErr.Message),
 					RecipientAddr: recipientEmail,
 					MessageSizeMB: messageSizeMB,
 				}, nil
 			}
 		}
 		// Other error - treat as "cannot send"
-		return &QuotaCheckResult{
+		return &MessageSizeLimitCheckResult{
 			CanSend:       false,
 			ErrorMessage:  fmt.Sprintf("Recipient rejected message: %v", err),
 			RecipientAddr: recipientEmail,
@@ -2148,12 +2148,12 @@ func (s *YggmailService) CheckRecipientQuota(recipientEmail string, messageSizeB
 		}, nil
 	}
 
-	// Success! Recipient has enough quota
+	// Success! Recipient can accept message
 	// Reset the transaction (we're not actually sending yet)
 	client.Reset()
 
-	s.logger.Printf("Recipient %s has sufficient quota for message (%.2f MB)", recipientHex[:8], messageSizeMB)
-	return &QuotaCheckResult{
+	s.logger.Printf("Recipient %s can accept message (%.2f MB)", recipientHex[:8], messageSizeMB)
+	return &MessageSizeLimitCheckResult{
 		CanSend:       true,
 		ErrorMessage:  "",
 		RecipientAddr: recipientEmail,

@@ -254,9 +254,9 @@ gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o yggm
    // Get email address
    val address = service.mailAddress
 
-   // Check unread quota
-   val quotaInfo = service.unreadQuotaInfo
-   Log.d("Yggmail", "Quota: ${quotaInfo.usedMB}/${quotaInfo.quotaMB} MB")
+   // Check message size limits
+   val sizeInfo = service.maxMessageSizeInfo
+   Log.d("Yggmail", "Max size: ${sizeInfo.maxSizeMB} MB")
 
    // Cleanup when done
    service.stop()
@@ -271,8 +271,8 @@ For detailed API documentation, see the source code in `mobile/yggmail.go`.
 - `Stop()` - Stop servers
 - `Close()` - Clean shutdown (call before app exit)
 - `GetMailAddress()` - Get your Yggmail address
-- `SetUnreadQuotaMB(mb)` - Set quota limit
-- `CheckRecipientQuota(email, size)` - Pre-check recipient quota
+- `SetMaxMessageSizeMB(mb)` - Set maximum message size limit
+- `CheckRecipientMessageSizeLimit(email, size)` - Pre-check if recipient can accept message
 - `OnNetworkChange()` - Call when WiFi/Mobile network changes
 - `UpdatePeers(peers)` - Update peer list without restart
 - `SetActive(active)` - Optimize for foreground/background
@@ -303,11 +303,11 @@ The code's also a bit of a mess, so sorry about that.
 - Atomic writes prevent corruption during transfers
 - Directory structure: `basePath/mailbox/messageID.eml`
 
-### Unread Quota System
-- Configurable limit on total size of unread messages (default: 10 MB)
-- Prevents inbox overflow and controls disk usage
-- Pre-send quota checking for 1-on-1 chats to avoid wasting bandwidth
-- Mobile API methods: `SetUnreadQuotaMB()`, `GetUnreadQuotaInfo()`, `CheckRecipientQuota()`
+### Message Size Limits
+- Configurable maximum message size (default: 10 MB)
+- Controls disk usage and prevents oversized messages
+- Pre-send size checking for 1-on-1 chats to avoid wasting bandwidth
+- Mobile API methods: `SetMaxMessageSizeMB()`, `GetMaxMessageSizeInfo()`, `CheckRecipientMessageSizeLimit()`
 
 ### Peer Discovery Integration
 - Asynchronous peer availability checking via `yggpeers` library

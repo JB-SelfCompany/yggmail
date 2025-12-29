@@ -50,22 +50,22 @@ func (s *SessionRemote) Mail(from string, opts smtp.MailOptions) error {
 		s.backend.Log.Printf("MAIL FROM SIZE extension: incoming message size=%d bytes (%.2f MB)",
 			incomingSize, float64(incomingSize)/(1024*1024))
 
-		quota, err := s.backend.Storage.ConfigGetUnreadQuota()
+		maxSize, err := s.backend.Storage.ConfigGetMaxMessageSize()
 		if err != nil {
 			s.backend.Log.Printf("Warning: failed to get message size limit in MAIL FROM: %v", err)
 		} else {
 			// Check if message size exceeds the limit
-			if incomingSize > quota {
+			if incomingSize > maxSize {
 				s.backend.Log.Printf("REJECTED (MAIL FROM): Message size %d bytes exceeds limit of %d bytes - %.2f MB / %.2f MB",
-					incomingSize, quota,
+					incomingSize, maxSize,
 					float64(incomingSize)/(1024*1024),
-					float64(quota)/(1024*1024))
+					float64(maxSize)/(1024*1024))
 				return fmt.Errorf("552 message size limit exceeded: %.2f MB exceeds limit of %.2f MB",
 					float64(incomingSize)/(1024*1024),
-					float64(quota)/(1024*1024))
+					float64(maxSize)/(1024*1024))
 			}
 			s.backend.Log.Printf("MAIL FROM size check passed: %d <= %d bytes",
-				incomingSize, quota)
+				incomingSize, maxSize)
 		}
 	}
 
@@ -111,19 +111,19 @@ func (s *SessionRemote) Data(r io.Reader) error {
 	// Fallback size check for clients that don't support SIZE extension (RFC 1870)
 	// Modern clients should be rejected earlier in Mail() method based on SIZE parameter
 	// This is an approximate check based on peek buffer size.
-	quota, err := s.backend.Storage.ConfigGetUnreadQuota()
+	maxSize, err := s.backend.Storage.ConfigGetMaxMessageSize()
 	if err != nil {
 		s.backend.Log.Printf("Warning: failed to get message size limit: %v", err)
 	} else {
 		// Check if message size exceeds the limit
-		if estimatedSize > quota {
+		if estimatedSize > maxSize {
 			s.backend.Log.Printf("REJECTED (DATA fallback): Message size %d bytes exceeds limit of %d bytes (%.2f MB / %.2f MB)",
-				estimatedSize, quota,
+				estimatedSize, maxSize,
 				float64(estimatedSize)/(1024*1024),
-				float64(quota)/(1024*1024))
+				float64(maxSize)/(1024*1024))
 			return fmt.Errorf("552 message size limit exceeded: %.2f MB exceeds limit of %.2f MB",
 				float64(estimatedSize)/(1024*1024),
-				float64(quota)/(1024*1024))
+				float64(maxSize)/(1024*1024))
 		}
 	}
 
@@ -191,18 +191,18 @@ func (s *SessionRemote) Data(r io.Reader) error {
 		}
 
 		actualSize := storedMail.Size
-		quota, quotaErr := s.backend.Storage.ConfigGetUnreadQuota()
-		if quotaErr == nil && actualSize > quota {
+		maxSize, maxSizeErr := s.backend.Storage.ConfigGetMaxMessageSize()
+		if maxSizeErr == nil && actualSize > maxSize {
 			// Size limit exceeded - delete the just-stored message
 			s.backend.Storage.MailDelete("INBOX", id)
 			s.backend.Storage.MailExpungeWithFileStore("INBOX", s.backend.FileStore)
 			s.backend.LargeMailLogger.EndOperation(opID, false, "size limit exceeded after storage")
 			s.backend.Log.Printf("REJECTED (post-storage): Message from %s exceeds size limit (%d bytes > %d bytes) - %.2f MB / %.2f MB",
-				s.from, actualSize, quota,
-				float64(actualSize)/(1024*1024), float64(quota)/(1024*1024))
+				s.from, actualSize, maxSize,
+				float64(actualSize)/(1024*1024), float64(maxSize)/(1024*1024))
 			return fmt.Errorf("552 message size limit exceeded: %.2f MB exceeds limit of %.2f MB",
 				float64(actualSize)/(1024*1024),
-				float64(quota)/(1024*1024))
+				float64(maxSize)/(1024*1024))
 		}
 
 		s.backend.LargeMailLogger.EndOperation(opID, true, "")
@@ -221,17 +221,17 @@ func (s *SessionRemote) Data(r io.Reader) error {
 
 		// Post-storage size check (in case message was larger than peek buffer)
 		actualSize := int64(len(b.Bytes()))
-		quota, quotaErr := s.backend.Storage.ConfigGetUnreadQuota()
-		if quotaErr == nil && actualSize > quota {
+		maxSize, maxSizeErr := s.backend.Storage.ConfigGetMaxMessageSize()
+		if maxSizeErr == nil && actualSize > maxSize {
 			// Size limit exceeded - delete the just-stored message
 			s.backend.Storage.MailDelete("INBOX", id)
 			s.backend.Storage.MailExpunge("INBOX")
 			s.backend.Log.Printf("REJECTED (post-storage): Message from %s exceeds size limit (%d bytes > %d bytes) - %.2f MB / %.2f MB",
-				s.from, actualSize, quota,
-				float64(actualSize)/(1024*1024), float64(quota)/(1024*1024))
+				s.from, actualSize, maxSize,
+				float64(actualSize)/(1024*1024), float64(maxSize)/(1024*1024))
 			return fmt.Errorf("552 message size limit exceeded: %.2f MB exceeds limit of %.2f MB",
 				float64(actualSize)/(1024*1024),
-				float64(quota)/(1024*1024))
+				float64(maxSize)/(1024*1024))
 		}
 
 		s.backend.Log.Printf("Stored mail from %s (MailID=%d, Size=%.2f MB)", s.from, id, float64(copied)/(1024*1024))
