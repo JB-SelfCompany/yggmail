@@ -40,7 +40,7 @@ const (
 	MIN_BACKOFF_SECONDS        = 60    // Start at 60 seconds (reduced from 30 for battery)
 	MAX_BACKOFF_SECONDS        = 3600  // Cap at 60 minutes (increased from 32 for battery)
 	BACKOFF_MULTIPLIER         = 2.0   // Exponential growth factor
-	UNDELIVERABLE_TIMEOUT_SECS = 604800 // 7 days - report as undeliverable after this time
+	UNDELIVERABLE_TIMEOUT_SECS = 86400 // 24 hours - report as undeliverable after this time
 
 	// Adaptive queue manager intervals for battery optimization
 	MANAGER_INTERVAL_ACTIVE = 60  // 1 minute when there are queued messages

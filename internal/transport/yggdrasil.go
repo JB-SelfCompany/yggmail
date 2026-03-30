@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -25,29 +26,31 @@ import (
 )
 
 type YggdrasilTransport struct {
-	yggquic *yggquic.YggdrasilTransport
-	core    *core.Core
+	mu         sync.RWMutex
+	yggquic    *yggquic.YggdrasilTransport
+	core       *core.Core
+	isActive   bool
+	isCharging bool
 }
 
 // getAdaptiveQUICConfig returns QUIC configuration optimized for battery life
 // while maintaining connection quality
 func getAdaptiveQUICConfig(isActive bool, isCharging bool) *quic.Config {
 	var keepAlive time.Duration
-	var maxIdle time.Duration
+	// MaxIdleTimeout MUST be large to survive Android Doze windows (up to 15+ min).
+	// Keeping it at 30min regardless of active state fixes disconnection in Doze mode.
+	const maxIdle = 30 * time.Minute
 
 	if isActive {
-		// User is actively using the app - use aggressive keep-alive for responsiveness
+		// Foreground: aggressive keep-alive for responsiveness
 		keepAlive = 5 * time.Second
-		maxIdle = 5 * time.Minute
 	} else if isCharging {
-		// Device is charging - moderate keep-alive for good delivery speed
-		keepAlive = 10 * time.Second
-		maxIdle = 10 * time.Minute
+		// Charging background: moderate keep-alive
+		keepAlive = 15 * time.Second
 	} else {
-		// Background mode on battery - balanced between delivery speed and battery
-		// 30s provides reasonable delivery latency while saving battery
-		keepAlive = 30 * time.Second
-		maxIdle = 10 * time.Minute
+		// Battery background: conservative keep-alive to save battery.
+		// 60s provides reasonable delivery latency while saving battery.
+		keepAlive = 60 * time.Second
 	}
 
 	return &quic.Config{
@@ -56,8 +59,7 @@ func getAdaptiveQUICConfig(isActive bool, isCharging bool) *quic.Config {
 		KeepAlivePeriod:         keepAlive,
 		EnableDatagrams:         false,
 		DisablePathMTUDiscovery: true,
-		// Increased from 512 to reduce overhead per packet
-		InitialPacketSize: 1200,
+		InitialPacketSize:       1200,
 	}
 }
 
@@ -98,14 +100,16 @@ func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.Pu
 	// This reduces packet count from 172,800/day to 1,440/day in background mode
 	quicConfig := getAdaptiveQUICConfig(isActive, isCharging)
 
-	yq, err := yggquic.New(ygg, quicConfig)
+	yq, err := yggquic.New(ygg, *cfg.Certificate, quicConfig)
 	if err != nil {
 		panic(err)
 	}
 
 	return &YggdrasilTransport{
-		yggquic: yq,
-		core:    ygg,
+		yggquic:    yq,
+		core:       ygg,
+		isActive:   isActive,
+		isCharging: isCharging,
 	}, nil
 }
 
@@ -154,4 +158,23 @@ func (t *YggdrasilTransport) GetPeers() []core.PeerInfo {
 		return nil
 	}
 	return t.core.GetPeers()
+}
+
+// UpdatePowerState updates QUIC configuration when device power state changes.
+// This updates new outgoing connections and closes existing ones so they
+// reconnect with the updated keepAlive period.
+// Battery impact: only changes keepAlive frequency, not connection count.
+func (t *YggdrasilTransport) UpdatePowerState(isActive bool, isCharging bool) {
+	t.mu.Lock()
+	changed := t.isActive != isActive || t.isCharging != isCharging
+	t.isActive = isActive
+	t.isCharging = isCharging
+	t.mu.Unlock()
+
+	if !changed {
+		return
+	}
+
+	newConfig := getAdaptiveQUICConfig(isActive, isCharging)
+	t.yggquic.UpdateQUICConfig(newConfig)
 }

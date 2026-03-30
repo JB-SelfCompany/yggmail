@@ -1130,15 +1130,23 @@ func (s *YggmailService) RecordMailActivity() {
 // Active mode uses more frequent heartbeats for better responsiveness
 func (s *YggmailService) SetActive(active bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.isActive != active {
-		s.isActive = active
+	changed := s.isActive != active
+	s.isActive = active
+	isCharging := s.isCharging
+	running := s.running
+	transport := s.transport
+	if changed {
 		if active {
 			s.logger.Println("App became active, increasing heartbeat frequency")
 		} else {
 			s.logger.Println("App became inactive, will reduce heartbeat frequency")
 		}
+	}
+	s.mu.Unlock()
+
+	// Update QUIC transport power state for new connections
+	if changed && running && transport != nil {
+		transport.UpdatePowerState(active, isCharging)
 	}
 }
 
@@ -1146,15 +1154,23 @@ func (s *YggmailService) SetActive(active bool) {
 // Charging state allows more aggressive network activity for better sync
 func (s *YggmailService) SetCharging(charging bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.isCharging != charging {
-		s.isCharging = charging
+	changed := s.isCharging != charging
+	s.isCharging = charging
+	isActive := s.isActive
+	running := s.running
+	transport := s.transport
+	if changed {
 		if charging {
 			s.logger.Println("Device charging, can use more aggressive network activity")
 		} else {
 			s.logger.Println("Device on battery, switching to power-efficient mode")
 		}
+	}
+	s.mu.Unlock()
+
+	// Update QUIC transport power state for new connections
+	if changed && running && transport != nil {
+		transport.UpdatePowerState(isActive, charging)
 	}
 }
 
@@ -1504,6 +1520,66 @@ func (s *YggmailService) UpdatePeers(peers string) error {
 	s.logger.Printf("Peer configuration updated successfully: %d peers configured\n", len(newPeerList))
 
 	return nil
+}
+
+// ReconnectDisconnectedPeers checks all configured peers and reconnects any
+// that are not currently connected. Called from Android MaintenanceReceiver.
+// Returns the number of peers that were reconnected.
+func (s *YggmailService) ReconnectDisconnectedPeers() int {
+	s.mu.RLock()
+	if !s.running || s.transport == nil {
+		s.mu.RUnlock()
+		return 0
+	}
+	lastPeers := s.lastPeers
+	s.mu.RUnlock()
+
+	if lastPeers == "" {
+		return 0
+	}
+
+	// Get currently connected peers from Yggdrasil core
+	connectedPeers := s.transport.GetPeers()
+	connectedMap := make(map[string]bool, len(connectedPeers))
+	for _, p := range connectedPeers {
+		if p.Up {
+			connectedMap[p.URI] = true
+		}
+	}
+
+	// Re-add any configured peers that are not connected
+	core := s.transport.GetCore()
+	if core == nil {
+		return 0
+	}
+
+	reconnected := 0
+	for _, peer := range strings.Split(lastPeers, ",") {
+		peer = strings.TrimSpace(peer)
+		if peer == "" {
+			continue
+		}
+		if !connectedMap[peer] {
+			u, err := url.Parse(peer)
+			if err != nil {
+				s.logger.Printf("ReconnectDisconnectedPeers: failed to parse peer URI %s: %v\n", peer, err)
+				continue
+			}
+			// RemovePeer first (ignore error — may not be registered)
+			_ = core.RemovePeer(u, "")
+			if err := core.AddPeer(u, ""); err != nil {
+				s.logger.Printf("ReconnectDisconnectedPeers: failed to add peer %s: %v\n", peer, err)
+			} else {
+				s.logger.Printf("ReconnectDisconnectedPeers: reconnecting peer %s\n", peer)
+				reconnected++
+			}
+		}
+	}
+
+	if reconnected > 0 {
+		s.logger.Printf("ReconnectDisconnectedPeers: triggered reconnection for %d peer(s)\n", reconnected)
+	}
+	return reconnected
 }
 
 // SetPeerBatchingParams sets batching parameters for peer discovery
@@ -2159,6 +2235,73 @@ func (s *YggmailService) CheckRecipientMessageSizeLimit(recipientEmail string, m
 		RecipientAddr: recipientEmail,
 		MessageSizeMB: messageSizeMB,
 	}, nil
+}
+
+// GetOutboundQueueCount returns the number of messages currently pending in the outbound queue.
+// Returns -1 if the service is not running or the storage is unavailable.
+func (s *YggmailService) GetOutboundQueueCount() int {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return -1
+	}
+
+	destinations, err := storage.QueueListDestinations()
+	if err != nil {
+		s.logger.Printf("GetOutboundQueueCount: error listing destinations: %v", err)
+		return -1
+	}
+
+	total := 0
+	for _, dst := range destinations {
+		mails, err := storage.QueueMailIDsForDestination(dst)
+		if err != nil {
+			s.logger.Printf("GetOutboundQueueCount: error listing mails for %s: %v", dst, err)
+			continue
+		}
+		total += len(mails)
+	}
+	return total
+}
+
+// ClearOutboundQueue removes all entries from the outbound send queue and returns the count removed.
+// Messages in the Outbox mailbox are not deleted — only their pending delivery entries are cleared.
+// Returns -1 on error.
+func (s *YggmailService) ClearOutboundQueue() int {
+	s.mu.RLock()
+	storage := s.storage
+	s.mu.RUnlock()
+
+	if storage == nil {
+		return -1
+	}
+
+	destinations, err := storage.QueueListDestinations()
+	if err != nil {
+		s.logger.Printf("ClearOutboundQueue: error listing destinations: %v", err)
+		return -1
+	}
+
+	cleared := 0
+	for _, dst := range destinations {
+		mails, err := storage.QueueMailIDsForDestination(dst)
+		if err != nil {
+			s.logger.Printf("ClearOutboundQueue: error listing mails for %s: %v", dst, err)
+			continue
+		}
+		for _, m := range mails {
+			if err := storage.QueueDeleteDestinationForID(dst, m.ID); err != nil {
+				s.logger.Printf("ClearOutboundQueue: error deleting queue entry dst=%s id=%d: %v", dst, m.ID, err)
+				continue
+			}
+			cleared++
+		}
+	}
+
+	s.logger.Printf("ClearOutboundQueue: cleared %d queue entries", cleared)
+	return cleared
 }
 
 // logWriter is a custom writer that forwards logs to the callback
