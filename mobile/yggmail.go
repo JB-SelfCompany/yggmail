@@ -1029,7 +1029,8 @@ func (s *YggmailService) OnPeerConnectionChange() {
 }
 
 // OnNetworkChange should be called when network connectivity changes (WiFi <-> Mobile)
-// This helps maintain stable connections on mobile devices
+// This helps maintain stable connections on mobile devices.
+// ponytail: prefers hot-reload over transport recreation to preserve QUIC sessions.
 func (s *YggmailService) OnNetworkChange() error {
 	s.mu.RLock()
 	running := s.running
@@ -1043,16 +1044,32 @@ func (s *YggmailService) OnNetworkChange() error {
 
 	s.logger.Println("Network change detected, refreshing connections...")
 
-	// Close existing transport to force reconnection
+	// Try hot-reload first -- preserves existing QUIC sessions.
+	// UpdatePeers uses Yggdrasil Core AddPeer/RemovePeer for live peer diff.
 	if s.transport != nil {
-		// Close the listener which will trigger reconnection
-		if err := s.transport.Listener().Close(); err != nil {
-			s.logger.Printf("Error closing transport on network change: %v\n", err)
+		if err := s.UpdatePeers(peers); err != nil {
+			s.logger.Printf("Hot-reload peers failed, falling back to transport recreation: %v\n", err)
+		} else {
+			// Hot-reload succeeded -- just reset retry counters for immediate delivery
+			if s.queues != nil {
+				s.queues.ResetRetryCounters()
+			}
+			s.logger.Println("Network connections refreshed via hot-reload (preserved QUIC sessions)")
+			if s.connCallback != nil {
+				s.connCallback.OnConnected("network_refreshed")
+			}
+			return nil
 		}
 	}
 
-	// Restart transport with same parameters and current power state
+	// Fallback: full transport recreation (only if hot-reload failed or transport is nil)
 	s.mu.Lock()
+	// Close old transport to prevent goroutine/port leaks
+	if s.transport != nil {
+		if err := s.transport.Listener().Close(); err != nil {
+			s.logger.Printf("Error closing old transport during fallback: %v\n", err)
+		}
+	}
 	rawLogger := log.New(s.logger.Writer(), "", 0)
 	newTransport, err := transport.NewYggdrasilTransport(
 		rawLogger,
@@ -1068,15 +1085,13 @@ func (s *YggmailService) OnNetworkChange() error {
 	}
 	s.transport = newTransport
 
-	// Update queues with new transport
 	if s.queues != nil {
 		s.queues.Transport = newTransport
-		// Reset retry counters to allow immediate delivery attempts
 		s.queues.ResetRetryCounters()
 	}
 	s.mu.Unlock()
 
-	s.logger.Println("Network connections refreshed successfully")
+	s.logger.Println("Network connections recreated (fallback)")
 	if s.connCallback != nil {
 		s.connCallback.OnConnected("network_refreshed")
 	}

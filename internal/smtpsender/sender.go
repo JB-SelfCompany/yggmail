@@ -35,10 +35,11 @@ import (
 )
 
 const (
-	// Battery-optimized retry strategy with long delays for mobile networks
-	// Retries at: 60, 180, 420, 900, 1860, 3720 seconds from start (then capped at 3600)
-	MIN_BACKOFF_SECONDS        = 60    // Start at 60 seconds (reduced from 30 for battery)
-	MAX_BACKOFF_SECONDS        = 3600  // Cap at 60 minutes (increased from 32 for battery)
+	// Adaptive retry strategy — starts fast, grows exponentially
+	// Retries at: 5, 10, 20, 40, 80, 160... seconds from start (then capped at 3600)
+	// ResetRetryCounters() is called on network changes to restart from MIN
+	MIN_BACKOFF_SECONDS        = 5     // Start at 5 seconds for quick recovery after network changes
+	MAX_BACKOFF_SECONDS        = 3600  // Cap at 60 minutes
 	BACKOFF_MULTIPLIER         = 2.0   // Exponential growth factor
 	UNDELIVERABLE_TIMEOUT_SECS = 86400 // 24 hours - report as undeliverable after this time
 
@@ -592,7 +593,7 @@ func (q *Queue) run() {
 
 // calculateBackoff calculates exponential backoff with jitter
 func calculateBackoff(retryCount int) int {
-	// Exponential backoff: 30, 60, 120, 240, 480, 960, 1920, 1920...
+	// Exponential backoff with jitter: MIN_BACKOFF * 2^(retryCount-1) ± 20%
 	backoff := float64(MIN_BACKOFF_SECONDS) * math.Pow(BACKOFF_MULTIPLIER, float64(retryCount-1))
 
 	// Cap at maximum

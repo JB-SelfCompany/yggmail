@@ -83,8 +83,11 @@ func (t *TableConfig) ConfigTryPassword(password string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// ponytail: no-password auth removed, was a security risk.
+	// Empty password hash means authentication is not configured.
+	// Require explicit password setup before allowing login.
 	if dbPasswordHash == "" {
-		return true, nil // TODO: Do we want to allow login if no password is set?
+		return false, fmt.Errorf("no password set - authentication requires a password")
 	}
 	err = bcrypt.CompareHashAndPassword([]byte(dbPasswordHash), []byte(password))
 	if err == nil {

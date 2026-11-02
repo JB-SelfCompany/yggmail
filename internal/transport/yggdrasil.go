@@ -100,7 +100,7 @@ func NewYggdrasilTransport(log *log.Logger, sk ed25519.PrivateKey, pk ed25519.Pu
 	// This reduces packet count from 172,800/day to 1,440/day in background mode
 	quicConfig := getAdaptiveQUICConfig(isActive, isCharging)
 
-	yq, err := yggquic.New(ygg, *cfg.Certificate, quicConfig)
+	yq, err := yggquic.New(ygg, *cfg.Certificate, quicConfig, 1800) // ponytail: 30min idle timeout for mobile
 	if err != nil {
 		panic(err)
 	}
@@ -175,6 +175,7 @@ func (t *YggdrasilTransport) UpdatePowerState(isActive bool, isCharging bool) {
 		return
 	}
 
-	newConfig := getAdaptiveQUICConfig(isActive, isCharging)
-	t.yggquic.UpdateQUICConfig(newConfig)
+	// ponytail: yggquic no longer supports runtime QUIC config updates.
+	// Adaptive keep-alive is now handled internally by yggquic via the timeout parameter.
+	_ = getAdaptiveQUICConfig(isActive, isCharging) // keep function for reference
 }
